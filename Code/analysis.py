@@ -84,6 +84,9 @@ class AnalysisTools:
         self._polygon_selection_sources = selected_srcs
         self._polygon_points = []
         self._polygon_actors = []
+
+        # Activate 2-D flattening so Z is ignored while selecting
+        self._flatten_z = True
         
         # Store original plotter state to restore later
         self._original_camera_position = self.viewer._plotter_widget.camera_position
@@ -120,6 +123,11 @@ class AnalysisTools:
         
         # Get coordinates for selected sections only
         coords_selected = self.viewer._coords_all[self._polygon_selection_mask]
+
+        # If flattening requested, zero-out Z so the scene is purely 2-D
+        if getattr(self, "_flatten_z", False):
+            coords_selected = coords_selected.copy()
+            coords_selected[:, 2] = 0  # collapse onto X-Y plane
         
         if coords_selected.shape[0] == 0:
             return
@@ -250,26 +258,30 @@ class AnalysisTools:
             self.viewer._plotter_widget.camera_position = [camera_pos, focal_point, view_up]
             self.viewer._plotter_widget.camera.parallel_projection = True
             
-            # COMPLETELY disable camera interaction to lock to 2D
-            self.viewer._plotter_widget.disable_fly_to_plane()
-            
-            # Disable all camera movements
+            # Store original settings before making changes
             interactor = self.viewer._plotter_widget.interactor
+            camera = self.viewer._plotter_widget.camera
             
-            # Remove all existing camera interaction styles
-            interactor.SetInteractorStyle(None)
+            # Store original interactor style and camera settings
+            self._original_interactor_style = interactor.GetInteractorStyle()
+            self._original_camera_settings = {
+                'position': list(camera.position),
+                'focal_point': list(camera.focal_point),
+                'view_up': list(camera.view_up),
+                'parallel_projection': camera.parallel_projection
+            }
             
-            # Create a custom interactor style that only allows picking
-            style = vtk.vtkInteractorStyleUser()
+            # Create a limited interactor style for 2-D interaction only
+            # vtkInteractorStyleImage supports pan/zoom but not rotation
+            style = vtk.vtkInteractorStyleImage()
             interactor.SetInteractorStyle(style)
             
-            # Store for restoration
-            self._original_interactor_style = interactor.GetInteractorStyle()
-            
+            print("Successfully locked to 2D view")  # Debug info
             self.viewer._plotter_widget.render()
             
         except Exception as e:
             print(f"Could not lock to 2D view: {e}")
+            # Continue anyway - the selection will still work, just won't be locked to 2D
 
     def _enable_polygon_picking(self):
         """Enable point picking for polygon creation."""
@@ -283,11 +295,27 @@ class AnalysisTools:
             self._pan_last_pos = None
             
             # Add mouse event observers
-            self.viewer._plotter_widget.interactor.AddObserver("LeftButtonPressEvent", self._on_polygon_mouse_press)
-            self.viewer._plotter_widget.interactor.AddObserver("LeftButtonReleaseEvent", self._on_polygon_mouse_release)
-            self.viewer._plotter_widget.interactor.AddObserver("MouseMoveEvent", self._on_polygon_mouse_move)
-            self.viewer._plotter_widget.interactor.AddObserver("RightButtonPressEvent", self._finish_polygon_selection)
-            self.viewer._plotter_widget.interactor.AddObserver("KeyPressEvent", self._on_key_press_polygon)
+            iren = self.viewer._plotter_widget.interactor
+            # Capture observer tags so we can remove them cleanly later
+            self._polygon_observer_tags = [
+                iren.AddObserver("LeftButtonPressEvent", self._on_polygon_mouse_press),
+                iren.AddObserver("LeftButtonReleaseEvent", self._on_polygon_mouse_release),
+                iren.AddObserver("MouseMoveEvent", self._on_polygon_mouse_move),
+                iren.AddObserver("RightButtonPressEvent", self._finish_polygon_selection),
+                iren.AddObserver("KeyPressEvent", self._on_key_press_polygon),
+            ]
+
+            # Block camera rotation events to keep view locked in 2-D.
+            def _block_event(obj, evt):
+                # Abort the event so default style won’t act on it
+                iren.SetAbortFlag(1)
+                iren.InvokeEvent("AbortCheckEvent")
+
+            for _evt in ("StartRotateEvent", "RotateEvent", "EndRotateEvent",
+                          "StartSpinEvent", "SpinEvent", "EndSpinEvent"):
+                self._polygon_observer_tags.append(
+                    iren.AddObserver(_evt, _block_event, 1.0)  # high priority ⇒ handled first
+                )
             
         except Exception as e:
             print(f"Could not enable polygon picking: {e}")
@@ -307,6 +335,10 @@ class AnalysisTools:
                 self._pan_last_pos = np.array([x, y])
                 # Store initial camera position
                 self._pan_start_camera = self.viewer._plotter_widget.camera_position
+
+                # Prevent default interactor style from processing this press (avoids duplicate pan)
+                interactor.SetAbortFlag(1)
+                interactor.InvokeEvent("AbortCheckEvent")
             else:
                 # Regular polygon point selection
                 self._add_polygon_point_from_click()
@@ -322,16 +354,19 @@ class AnalysisTools:
 
     def _on_polygon_mouse_move(self, obj, event):
         """Handle mouse movement for panning."""
-        # Only pan if we're actively panning AND shift is still being held
-        if not self._is_panning or self._pan_start_pos is None:
-            return
-            
-        # Check if shift is still being held - if not, stop panning
         interactor = self.viewer._plotter_widget.interactor
-        if not interactor.GetShiftKey():
-            self._is_panning = False
-            self._pan_start_pos = None
-            self._pan_last_pos = None
+
+        shift_pressed = interactor.GetShiftKey()
+        left_pressed = interactor.GetLeftButton()
+
+        # If shift is held but mouse button not pressed, block the event to avoid unintended movement
+        if shift_pressed and not left_pressed:
+            interactor.SetAbortFlag(1)
+            interactor.InvokeEvent("AbortCheckEvent")
+            return
+
+        # Only pan if we're actively panning AND shift is still being held
+        if not self._is_panning or self._pan_start_pos is None or not shift_pressed:
             return
             
         try:
@@ -369,7 +404,11 @@ class AnalysisTools:
             camera.focal_point = new_focal_point
             
             self.viewer._plotter_widget.render()
-            
+
+            # Block default processing of this move event as we've handled camera update
+            interactor.SetAbortFlag(1)
+            interactor.InvokeEvent("AbortCheckEvent")
+
         except Exception as e:
             print(f"Error in panning: {e}")
 
@@ -395,7 +434,9 @@ class AnalysisTools:
             # Find closest point in selected data
             distances = np.linalg.norm(coords_selected - point, axis=1)
             closest_idx = np.argmin(distances)
-            snapped_point = coords_selected[closest_idx]
+            snapped_point = coords_selected[closest_idx].copy()
+            if getattr(self, "_flatten_z", False):
+                snapped_point[2] = 0  # keep on XY plane
             
             # Add this point to polygon
             self._add_polygon_point(snapped_point)
@@ -405,6 +446,9 @@ class AnalysisTools:
 
     def _add_polygon_point(self, point):
         """Add a polygon vertex and update visualization."""
+        if getattr(self, "_flatten_z", False):
+            point = point.copy(); point[2] = 0
+
         self._polygon_points.append(point)
         
         # Calculate smaller adaptive radius based on selected data scale
@@ -425,7 +469,11 @@ class AnalysisTools:
         # If we have more than one point, draw line between last two points
         if len(self._polygon_points) > 1:
             # Create line between last two points
-            points = np.array([self._polygon_points[-2], self._polygon_points[-1]])
+            p_prev = self._polygon_points[-2].copy()
+            p_curr = self._polygon_points[-1].copy()
+            if getattr(self, "_flatten_z", False):
+                p_prev[2] = p_curr[2] = 0
+            points = np.array([p_prev, p_curr])
             line = pv.Line(points[0], points[1])
             line_actor = self.viewer._plotter_widget.add_mesh(
                 line,
@@ -516,19 +564,52 @@ class AnalysisTools:
         msg_box.setDefaultButton(continue_btn)
         
         # Style the dialog for better appearance
+        button_style = """
+            QPushButton {
+                background-color: #404040;
+                color: white;
+                border: 2px solid #606060;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border-color: #707070;
+            }
+            QPushButton:pressed {
+                background-color: #353535;
+                border-color: #505050;
+            }
+        """
+        
+        continue_style = button_style + """
+            QPushButton {
+                background-color: #2196F3;
+                border-color: #1976D2;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+                border-color: #1565C0;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+                border-color: #0D47A1;
+            }
+        """
+        
+        # Apply styles to buttons
+        quit_btn.setStyleSheet(button_style)
+        reselect_btn.setStyleSheet(button_style)
+        continue_btn.setStyleSheet(continue_style)
+        
         msg_box.setStyleSheet("""
             QMessageBox {
                 font-size: 12px;
-            }
-            QPushButton {
-                min-width: 80px;
-                padding: 6px 12px;
-                font-size: 11px;
-            }
-            QPushButton[text="Continue"] {
-                background-color: #2196F3;
+                background-color: #2b2b2b;
                 color: white;
-                font-weight: bold;
             }
         """)
         
@@ -569,6 +650,11 @@ class AnalysisTools:
     def _highlight_selected_cells(self, selected_coords):
         """Temporarily highlight selected cells for confirmation."""
         try:
+            # Respect 2-D flattening during selection
+            if getattr(self, "_flatten_z", False):
+                selected_coords = selected_coords.copy()
+                selected_coords[:, 2] = 0
+
             # Calculate radius for highlighting
             coords = self.viewer._coords_all[self._polygon_selection_mask]
             scene_scale = max(coords[:, 0].ptp(), coords[:, 1].ptp(), coords[:, 2].ptp())
@@ -617,28 +703,38 @@ class AnalysisTools:
         # Remove any selection highlights
         self._remove_selection_highlight()
         
-        # Restore original camera position and settings
+        # Restore original camera settings
+        if hasattr(self, '_original_camera_settings'):
+            try:
+                camera = self.viewer._plotter_widget.camera
+                settings = self._original_camera_settings
+                camera.position = settings['position']
+                camera.focal_point = settings['focal_point']
+                camera.view_up = settings['view_up']
+                camera.parallel_projection = settings['parallel_projection']
+            except Exception as e:
+                print(f"Could not restore camera settings: {e}")
+        
+        # Restore original camera position if available
         if hasattr(self, '_original_camera_position'):
             try:
                 self.viewer._plotter_widget.camera_position = self._original_camera_position
-                self.viewer._plotter_widget.camera.parallel_projection = False
-            except:
-                pass
+            except Exception as e:
+                print(f"Could not restore camera position: {e}")
         
         # Restore original interactor style
-        try:
-            # Reset to default PyVista interactor style
-            import vtk
-            default_style = vtk.vtkInteractorStyleTrackballCamera()
-            self.viewer._plotter_widget.interactor.SetInteractorStyle(default_style)
-        except:
-            pass
-        
-        # Re-enable normal camera interaction
-        try:
-            self.viewer._plotter_widget.enable_fly_to_plane()
-        except:
-            pass
+        if hasattr(self, '_original_interactor_style'):
+            try:
+                self.viewer._plotter_widget.interactor.SetInteractorStyle(self._original_interactor_style)
+            except Exception as e:
+                print(f"Could not restore interactor style: {e}")
+        else:
+            # Fallback: set default trackball camera style
+            try:
+                default_style = vtk.vtkInteractorStyleTrackballCamera()
+                self.viewer._plotter_widget.interactor.SetInteractorStyle(default_style)
+            except Exception as e:
+                print(f"Could not set default interactor style: {e}")
         
         # Disable picking
         try:
@@ -647,14 +743,15 @@ class AnalysisTools:
             pass
         
         # Remove observers
-        try:
-            self.viewer._plotter_widget.interactor.RemoveObservers("LeftButtonPressEvent")
-            self.viewer._plotter_widget.interactor.RemoveObservers("LeftButtonReleaseEvent")
-            self.viewer._plotter_widget.interactor.RemoveObservers("MouseMoveEvent")
-            self.viewer._plotter_widget.interactor.RemoveObservers("RightButtonPressEvent")
-            self.viewer._plotter_widget.interactor.RemoveObservers("KeyPressEvent")
-        except:
-            pass
+        # Clean up only the observers we added so default interaction remains intact
+        if hasattr(self, '_polygon_observer_tags'):
+            iren = self.viewer._plotter_widget.interactor
+            for tag in self._polygon_observer_tags:
+                try:
+                    iren.RemoveObserver(tag)
+                except Exception as e:
+                    print(f"Could not remove observer {tag}: {e}")
+            del self._polygon_observer_tags
         
         # Restore original data view (re-render all data as it was)
         try:
@@ -674,6 +771,10 @@ class AnalysisTools:
             del self._polygon_selection_mask
         if hasattr(self, '_polygon_selection_sources'):
             del self._polygon_selection_sources
+        if hasattr(self, '_original_camera_settings'):
+            del self._original_camera_settings
+        if hasattr(self, '_flatten_z'):
+            del self._flatten_z
         
         self.viewer._plotter_widget.render()
         
@@ -924,13 +1025,25 @@ class CompositionAnalysisDialog(QDialog):
         """Set up the dialog UI with plots and statistics."""
         layout = QVBoxLayout(self)
         
-        # Create matplotlib figure
-        fig = Figure(figsize=(8, 6))
+        # Create matplotlib figure with better size and DPI
+        fig = Figure(figsize=(10, 7), dpi=100)
+        fig.patch.set_facecolor('white')
         canvas = FigureCanvas(fig)
         layout.addWidget(canvas)
-        
-        # Create subplots
-        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+
+        # Add interactive toolbar for zooming/panning
+        try:
+            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+            toolbar = NavigationToolbar(canvas, self)
+            toolbar.setStyleSheet("QToolBar { background: #2b2b2b; border: 1px solid #555; }")
+            layout.addWidget(toolbar)
+        except Exception:
+            # Fallback: if toolbar import fails, continue without it
+            pass
+
+        # Create subplots with better spacing
+        gs = fig.add_gridspec(2, 2, hspace=0.4, wspace=0.4, 
+                             left=0.1, right=0.95, top=0.93, bottom=0.15)
         
         # Main bar plot
         ax1 = fig.add_subplot(gs[0, :])
@@ -944,41 +1057,87 @@ class CompositionAnalysisDialog(QDialog):
         ax3 = fig.add_subplot(gs[1, 1])
         self._plot_statistics_text(ax3)
         
-        fig.tight_layout()
+        # Use tight_layout with padding
+        fig.tight_layout(pad=2.0)
         
-        # Add export button
+        # Add export button with main screen styling
         export_layout = QHBoxLayout()
         export_layout.addStretch()
         
+        # Apply main screen button style
+        button_style = """
+            QPushButton {
+                background-color: #404040;
+                color: white;
+                border: 2px solid #606060;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border-color: #707070;
+            }
+            QPushButton:pressed {
+                background-color: #353535;
+                border-color: #505050;
+            }
+        """
+        
         from PyQt5.QtWidgets import QPushButton
         export_btn = QPushButton("Export Results")
+        export_btn.setStyleSheet(button_style)
         export_btn.clicked.connect(self._export_results)
         export_layout.addWidget(export_btn)
         
         close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(button_style)
         close_btn.clicked.connect(self.accept)
         export_layout.addWidget(close_btn)
         
         layout.addLayout(export_layout)
     
     def _plot_composition_bar(self, ax):
-        """Plot bar chart of cell type composition."""
+        """Plot bar chart of cell type composition with improved text handling."""
         perc = self.results["percentages"]
         
         # Use colors that match the main viewer if possible
-        bars = ax.bar(perc.index, perc.values, color="#1f77b4", alpha=0.7)
+        bars = ax.bar(perc.index, perc.values, color="#1f77b4", alpha=0.7, edgecolor='black', linewidth=0.5)
         
-        ax.set_ylabel("Percentage (%)")
-        ax.set_title(f"Cell Type Composition ({self.results['total_cells']} cells)")
-        ax.set_xticklabels(perc.index, rotation=45, ha="right")
+        ax.set_ylabel("Percentage (%)", fontsize=11, fontweight='bold')
+        ax.set_title(f"Cell Type Composition ({self.results['total_cells']} cells)", 
+                    fontsize=13, fontweight='bold', pad=15)
         
-        # Add value labels on bars
+        # Improve x-axis label handling to prevent overlap
+        if len(perc.index) > 10:
+            # For many categories, use smaller font and vertical rotation
+            ax.set_xticklabels(perc.index, rotation=90, ha="center", fontsize=9)
+        elif len(perc.index) > 5:
+            # For moderate categories, use 45-degree rotation
+            ax.set_xticklabels(perc.index, rotation=45, ha="right", fontsize=10)
+        else:
+            # For few categories, keep horizontal
+            ax.set_xticklabels(perc.index, rotation=0, ha="center", fontsize=11)
+        
+        # Add value labels on bars with better positioning
         for bar, value in zip(bars, perc.values):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
-                   f'{value:.1f}%', ha='center', va='bottom', fontsize=9)
+            height = bar.get_height()
+            # Position text above bar with some padding
+            label_y = height + max(perc.values) * 0.01
+            ax.text(bar.get_x() + bar.get_width()/2, label_y,
+                   f'{value:.1f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        # Set y-axis limit to accommodate labels
+        ax.set_ylim(0, max(perc.values) * 1.15)
+        
+        # Improve grid and styling
+        ax.grid(True, alpha=0.3, axis='y')
+        ax.set_axisbelow(True)
     
     def _plot_composition_pie(self, ax):
-        """Plot pie chart of cell type composition."""
+        """Plot pie chart of cell type composition with better label handling."""
         perc = self.results["percentages"]
         
         # Only show top 8 categories, group others
@@ -990,48 +1149,70 @@ class CompositionAnalysisDialog(QDialog):
         else:
             plot_data = perc
         
+        # Use better color palette
+        colors = plt.cm.Set3(np.linspace(0, 1, len(plot_data)))
+        
+        # Create pie chart with better label positioning
         wedges, texts, autotexts = ax.pie(
             plot_data.values, 
             labels=plot_data.index,
             autopct='%1.1f%%',
-            startangle=90
+            startangle=90,
+            colors=colors,
+            pctdistance=0.85,
+            labeldistance=1.1
         )
         
-        ax.set_title("Composition Overview")
+        ax.set_title("Composition Overview", fontsize=12, fontweight='bold', pad=15)
         
-        # Make percentage text smaller if many categories
+        # Improve text formatting
         for autotext in autotexts:
-            autotext.set_fontsize(8)
+            autotext.set_fontsize(9)
+            autotext.set_fontweight('bold')
+            autotext.set_color('white')
+        
+        for text in texts:
+            text.set_fontsize(9)
+            # Truncate long labels
+            if len(text.get_text()) > 12:
+                text.set_text(text.get_text()[:10] + "...")
     
     def _plot_statistics_text(self, ax):
-        """Display summary statistics as text."""
+        """Display summary statistics as text with better formatting."""
         ax.axis('off')
         
-        stats_text = f"""Summary Statistics:
-
-Total cells: {self.results['total_cells']:,}
-Unique cell types: {self.results['unique_types']}
-
-Most abundant: 
-{self.results['percentages'].index[0]} 
-({self.results['percentages'].iloc[0]:.1f}%)
-
-Least abundant: 
-{self.results['percentages'].index[-1]} 
-({self.results['percentages'].iloc[-1]:.1f}%)
-"""
+        # Create more organized statistics text
+        stats_lines = [
+            "Summary Statistics:",
+            "",
+            f"Total cells: {self.results['total_cells']:,}",
+            f"Unique cell types: {self.results['unique_types']}",
+            "",
+            "Most abundant:",
+            f"{self.results['percentages'].index[0]}",
+            f"({self.results['percentages'].iloc[0]:.1f}%)",
+            "",
+            "Least abundant:",
+            f"{self.results['percentages'].index[-1]}",
+            f"({self.results['percentages'].iloc[-1]:.1f}%)"
+        ]
         
         # Add metadata if available
         if self.results['metadata']:
             meta = self.results['metadata']
+            stats_lines.append("")
             if 'mean_counts' in meta:
-                stats_text += f"\nMean UMI counts: {meta['mean_counts']:.0f}"
+                stats_lines.append(f"Mean UMI counts: {meta['mean_counts']:.0f}")
             if 'sources' in meta:
                 n_sources = len(meta['sources'])
-                stats_text += f"\nSections represented: {n_sources}"
+                stats_lines.append(f"Sections represented: {n_sources}")
+        
+        # Join lines and display with better formatting
+        stats_text = "\n".join(stats_lines)
         
         ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, 
-               fontsize=10, verticalalignment='top', fontfamily='monospace')
+               fontsize=11, verticalalignment='top', fontfamily='monospace',
+               bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
     
     def _export_results(self):
         """Export analysis results to CSV file."""

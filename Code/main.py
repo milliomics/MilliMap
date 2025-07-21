@@ -20,10 +20,13 @@ except (ImportError, ValueError):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    # Set application icon globally
-    icon_path = "millimap/Icons/cakeinvert.png"
-    if pathlib.Path(icon_path).exists():
-        app.setWindowIcon(QIcon(icon_path))
+    # Set application icon globally using relative path
+    # Get the directory containing this file (millimap/Code/)
+    current_dir = pathlib.Path(__file__).parent
+    # Navigate to millimap/Icons/cakeinvert.png
+    icon_path = current_dir.parent / "Icons" / "cakeinvert.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     viewer = MillimapViewer()
     viewer.show()
     sys.exit(app.exec_())

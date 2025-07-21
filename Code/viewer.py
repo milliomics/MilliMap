@@ -85,10 +85,11 @@ class MillimapViewer(QMainWindow):
         # -----------------------------------------------------------------
         # Set window icon
         # -----------------------------------------------------------------
-        icon_path = "/Users/farah/Library/CloudStorage/GoogleDrive-qianluf2@illinois.edu/My Drive/Milliomics/Designs/cakeinvert.png"
-        p = pathlib.Path(icon_path)
-        if p.exists():
-            pix = QPixmap(str(p))
+        # Use relative path to icon file
+        current_dir = pathlib.Path(__file__).parent
+        icon_path = current_dir.parent / "Icons" / "cakeinvert.png"
+        if icon_path.exists():
+            pix = QPixmap(str(icon_path))
             # Composite over white background to avoid transparency issues
             white_bg = QPixmap(pix.size())
             white_bg.fill(Qt.white)
@@ -567,7 +568,27 @@ class MillimapViewer(QMainWindow):
         if cam_position is not None:
             self._plotter_widget.camera_position = cam_position
         else:
+            # Reset camera then set to a top-down view so initial display is not rotated
             self._plotter_widget.reset_camera()
+
+            # Compute top-down camera parameters based on overall bounds
+            try:
+                bounds = coords_full.min(axis=0), coords_full.max(axis=0)
+                (xmin, ymin, zmin), (xmax, ymax, zmax) = bounds
+                x_center = (xmin + xmax) / 2.0
+                y_center = (ymin + ymax) / 2.0
+                z_center = (zmin + zmax) / 2.0
+                view_dist = max(xmax - xmin, ymax - ymin) * 1.5 + (zmax - zmin)
+
+                camera_pos = [x_center, y_center, z_max := zmax + view_dist]
+                focal_point = [x_center, y_center, z_center]
+                view_up = [0, 1, 0]
+                self._plotter_widget.camera_position = [camera_pos, focal_point, view_up]
+                self._plotter_widget.camera.parallel_projection = True
+            except Exception:
+                # Fallback: leave default orientation if anything fails
+                pass
+
             self._has_initial_camera = True
 
         self._plotter_widget.render()
