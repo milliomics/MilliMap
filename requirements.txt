@@ -1,0 +1,20 @@
+# Core GUI and Visualization
+PyQt5>=5.15.0
+pyvista>=0.40.0
+pyvistaqt>=0.9.0
+vtk>=9.0.0
+
+# Scientific Computing
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# Single-cell Data
+anndata>=0.8.0
+
+# Plotting and Visualization
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional: For enhanced functionality
+pathlib2>=2.3.0  # For Python < 3.4 compatibility (if needed) 
