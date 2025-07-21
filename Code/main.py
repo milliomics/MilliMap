@@ -21,7 +21,7 @@ except (ImportError, ValueError):
 def main() -> None:
     app = QApplication(sys.argv)
     # Set application icon globally
-    icon_path = "/Users/farah/Library/CloudStorage/GoogleDrive-qianluf2@illinois.edu/My Drive/Milliomics/Designs/cakeinvert.png"
+    icon_path = "millimap/Icons/cakeinvert.png"
     if pathlib.Path(icon_path).exists():
         app.setWindowIcon(QIcon(icon_path))
     viewer = MillimapViewer()

@@ -3,6 +3,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.path as mpath
+import matplotlib.colors as mcolors
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from matplotlib.widgets import PolygonSelector
@@ -10,7 +11,8 @@ from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtGui import QCursor
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTabWidget,
-    QWidget, QScrollArea, QCheckBox, QMessageBox, QInputDialog, QSizePolicy
+    QWidget, QScrollArea, QCheckBox, QMessageBox, QInputDialog, QSizePolicy,
+    QFrame
 )
 from typing import Optional, List
 
@@ -303,8 +305,16 @@ class LassoSelectionDialog(QDialog):
 
     def __init__(self, coords2d: np.ndarray, indices: np.ndarray, clusters: Optional[np.ndarray], viewer):
         super().__init__(viewer)
-        self.setWindowTitle("Polygon Selection (2-D)")
+        self.setWindowTitle("🔺 Millimap - Polygon Selection (2-D)")
         self.resize(700, 700)
+        
+        # Modern dialog styling
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: white;
+            }
+        """)
 
         self._coords2d = coords2d
         self._indices = indices
@@ -314,40 +324,99 @@ class LassoSelectionDialog(QDialog):
         fig = Figure(facecolor="black")
         self._canvas = FigureCanvas(fig)
         vbox.addWidget(self._canvas)
-        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
-        vbox.addWidget(NavigationToolbar2QT(self._canvas, self))
+        
+        # Create custom modern toolbar instead of default matplotlib toolbar
+        self._create_custom_toolbar(vbox)
 
         self._ax = fig.add_subplot(111)
 
-        # Color-coding by clusters if provided
+        # Color-coding by clusters using viewer's color scheme
         if clusters is not None:
             uniq = np.unique(clusters)
-            # Use viewer's palette util if available else tab20
-            if hasattr(viewer, "_generate_plotly_extended_palette"):
-                palette = viewer._generate_plotly_extended_palette(len(uniq))
+            
+            # Use viewer's color scheme exactly like main screen
+            if hasattr(viewer, '_color_scheme'):
+                color_scheme = viewer._color_scheme
             else:
-                cmap = plt.get_cmap("tab20", len(uniq))
-                palette = [cmap(i)[:3] for i in range(len(uniq))]
-            lookup = {u: palette[i] for i, u in enumerate(uniq)}
-            colors = [lookup[c] for c in clusters]
+                color_scheme = "plotly_d3"  # fallback
+            
+            # Generate colors using same logic as main screen
+            if color_scheme == "anndata" and hasattr(viewer, '_adata') and viewer._adata is not None:
+                if "clusters_colors" in viewer._adata.obs:
+                    try:
+                        # Create a mapping from cluster to color from the full dataset
+                        all_clusters = viewer._adata.obs["clusters"].astype(str)
+                        all_colors = viewer._adata.obs["clusters_colors"]
+                        color_map = dict(zip(all_clusters, all_colors))
+                        # Map the colors for our subset
+                        colors = [mcolors.to_rgb(str(color_map.get(c, 'white'))) for c in clusters]
+                    except Exception:
+                        # Fallback if color parsing fails
+                        colors = "white"
+                else:
+                    colors = "white"
+            else:
+                # Import the color functions (they should be available from viewer)
+                try:
+                    if color_scheme == "plotly_d3":
+                        from .colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(uniq))
+                    elif color_scheme == "custom_turbo":
+                        from .colors import generate_custom_turbo_palette
+                        palette = generate_custom_turbo_palette(len(uniq))
+                    elif color_scheme == "sns_palette":
+                        from .colors import generate_sns_palette
+                        palette = generate_sns_palette(len(uniq))
+                    elif color_scheme == "milliomics":
+                        from .colors import generate_milliomics_palette
+                        palette = generate_milliomics_palette(len(uniq))
+                    else:  # fallback to plotly_d3
+                        from .colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(uniq))
+                    
+                    lookup = {u: palette[i % len(palette)] for i, u in enumerate(uniq)}
+                    colors = [lookup[c] for c in clusters]
+                except (ImportError, ValueError):
+                    # Fallback for import issues
+                    try:
+                        if hasattr(viewer, "_generate_plotly_extended_palette"):
+                            palette = viewer._generate_plotly_extended_palette(len(uniq))
+                        else:
+                            cmap = plt.get_cmap("tab20", len(uniq))
+                            palette = [cmap(i)[:3] for i in range(len(uniq))]
+                        lookup = {u: palette[i] for i, u in enumerate(uniq)}
+                        colors = [lookup[c] for c in clusters]
+                    except Exception:
+                        colors = "white"
         else:
             colors = "white"
 
-        self._ax.scatter(coords2d[:, 0], coords2d[:, 1], s=6, c=colors)
+        # Use same spot size as main screen (5)
+        self._ax.scatter(coords2d[:, 0], coords2d[:, 1], s=5, c=colors)
         self._ax.set_aspect("equal", adjustable="box")
         self._ax.set_facecolor("black")
         self._ax.set_xticks([]); self._ax.set_yticks([])
 
-        # Polygon selector (click to add points, double-click/enter to finish)
-        # Older Matplotlib versions (<3.8) don't support the "interactive" keyword.
-        self._poly = PolygonSelector(
-            self._ax,
-            self._on_select,
-            props=dict(color="yellow", linewidth=2, alpha=0.8),
-        )
+        # Initialize polygon mode state
+        self._polygon_mode = False
+        self._poly = None
+        self._shift_pressed = False
+        
+        # Initialize polygon selector (will be created when polygon mode is activated)
+        self._create_polygon_selector()
 
-        instruct = QLabel("Click to add vertices. Double-click or press Enter to finish.\nShift+Drag: pan, Scroll: zoom")
-        instruct.setStyleSheet("color: white;")
+        instruct = QLabel("🎯 Pan & Zoom mode: Shift+drag to pan • Mouse wheel to zoom • Click 'Add Polygon' button to start drawing")
+        instruct.setStyleSheet("""
+            QLabel {
+                color: #e0e0e0;
+                background-color: #333;
+                padding: 12px;
+                border-radius: 8px;
+                font-size: 13px;
+                margin: 4px;
+                border: 1px solid #555;
+            }
+        """)
         vbox.addWidget(instruct)
 
         # Pan/zoom handlers via events
@@ -356,27 +425,219 @@ class LassoSelectionDialog(QDialog):
         self._cid_release = self._canvas.mpl_connect("button_release_event", self._on_release)
         self._cid_motion = self._canvas.mpl_connect("motion_notify_event", self._on_motion)
         self._cid_scroll = self._canvas.mpl_connect("scroll_event", self._on_scroll)
+        self._cid_key_press = self._canvas.mpl_connect("key_press_event", self._on_key_press)
+        self._cid_key_release = self._canvas.mpl_connect("key_release_event", self._on_key_release)
+        
+        # Make sure the canvas can receive focus for key events
+        self._canvas.setFocusPolicy(Qt.ClickFocus)
+        self._canvas.setFocus()
+        
+        # Initialize view history for back/forward navigation
+        self._view_history = []
+        self._view_position = -1
+        self._save_view()  # Save initial view
 
-    # ---------------- selection ----------------
-    def _on_select(self, verts):
-        path = mpath.Path(verts)
-        mask = path.contains_points(self._coords2d)
-        if not mask.any():
-            QMessageBox.information(self, "Selection", "No cells inside polygon.")
-            return
-        selected_idxs = self._indices[mask]
-        self._viewer._process_selection(self._viewer._coords_all[selected_idxs])
-        self.accept()
-
+    def _create_custom_toolbar(self, parent_layout):
+        """Create a modern, styled toolbar for navigation."""
+        # Toolbar container with dark styling
+        toolbar_frame = QFrame()
+        toolbar_frame.setStyleSheet("""
+            QFrame {
+                background-color: #2b2b2b;
+                border: 1px solid #555;
+                border-radius: 8px;
+                margin: 2px;
+            }
+        """)
+        
+        toolbar_layout = QHBoxLayout(toolbar_frame)
+        toolbar_layout.setSpacing(8)
+        toolbar_layout.setContentsMargins(10, 8, 10, 8)
+        
+        # Button styling for modern appearance
+        button_style = """
+            QPushButton {
+                background-color: #404040;
+                color: white;
+                border: 2px solid #606060;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 60px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border-color: #707070;
+            }
+            QPushButton:pressed {
+                background-color: #353535;
+                border-color: #505050;
+            }
+            QPushButton:disabled {
+                background-color: #2a2a2a;
+                color: #666;
+                border-color: #444;
+            }
+        """
+        
+        # Home button
+        home_btn = QPushButton("🏠 Home")
+        home_btn.setStyleSheet(button_style)
+        home_btn.clicked.connect(self._home_view)
+        home_btn.setToolTip("Reset view to show all data")
+        toolbar_layout.addWidget(home_btn)
+        
+        # Back button  
+        back_btn = QPushButton("⬅ Back")
+        back_btn.setStyleSheet(button_style)
+        back_btn.clicked.connect(self._back_view)
+        back_btn.setToolTip("Go back to previous view")
+        toolbar_layout.addWidget(back_btn)
+        
+        # Forward button
+        forward_btn = QPushButton("➡ Forward")
+        forward_btn.setStyleSheet(button_style)
+        forward_btn.clicked.connect(self._forward_view)
+        forward_btn.setToolTip("Go forward to next view")
+        toolbar_layout.addWidget(forward_btn)
+        
+        # Separator
+        toolbar_layout.addWidget(self._create_separator())
+        
+        # Polygon Mode Toggle Button
+        self._polygon_btn = QPushButton("🔺 Add Polygon")
+        polygon_style = button_style + """
+            QPushButton:checked {
+                background-color: #2196F3;
+                border-color: #1976D2;
+            }
+        """
+        self._polygon_btn.setStyleSheet(polygon_style)
+        self._polygon_btn.setCheckable(True)
+        self._polygon_btn.toggled.connect(self._toggle_polygon_mode)
+        self._polygon_btn.setToolTip("Toggle polygon drawing mode • ESC to exit polygon mode")
+        toolbar_layout.addWidget(self._polygon_btn)
+        
+        # Pan button (for visual feedback only)
+        pan_btn = QPushButton("✋ Pan")
+        pan_btn.setStyleSheet(button_style)
+        pan_btn.setToolTip("Pan: Hold Shift + Left Click and drag")
+        pan_btn.setEnabled(False)  # Just for visual reference
+        toolbar_layout.addWidget(pan_btn)
+        
+        # Zoom button (for visual feedback only)
+        zoom_btn = QPushButton("🔍 Zoom")
+        zoom_btn.setStyleSheet(button_style)
+        zoom_btn.setToolTip("Zoom: Mouse wheel to zoom in/out")
+        zoom_btn.setEnabled(False)  # Just for visual reference
+        toolbar_layout.addWidget(zoom_btn)
+        
+        # Separator
+        toolbar_layout.addWidget(self._create_separator())
+        
+        # Configure button
+        config_btn = QPushButton("⚙️ Configure")
+        config_btn.setStyleSheet(button_style)
+        config_btn.clicked.connect(self._configure_plot)
+        config_btn.setToolTip("Configure plot settings")
+        toolbar_layout.addWidget(config_btn)
+        
+        # Save button
+        save_btn = QPushButton("💾 Save")
+        save_btn.setStyleSheet(button_style)
+        save_btn.clicked.connect(self._save_plot)
+        save_btn.setToolTip("Save the current plot")
+        toolbar_layout.addWidget(save_btn)
+        
+        # Stretch to push coordinates to the right
+        toolbar_layout.addStretch()
+        
+        # Coordinates label
+        self._coords_label = QLabel("x=0, y=0")
+        self._coords_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-family: monospace;
+                font-size: 11px;
+                padding: 4px 8px;
+                background-color: #333;
+                border-radius: 4px;
+            }
+        """)
+        toolbar_layout.addWidget(self._coords_label)
+        
+        parent_layout.addWidget(toolbar_frame)
+        
+        # Connect mouse move to update coordinates
+        self._canvas.mpl_connect("motion_notify_event", self._update_coordinates)
+        
+    def _create_separator(self):
+        """Create a visual separator for the toolbar."""
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setStyleSheet("color: #666; margin: 0px 4px;")
+        return separator
+        
+    def _update_coordinates(self, event):
+        """Update coordinate display."""
+        if event.inaxes:
+            self._coords_label.setText(f"x={event.xdata:.0f}, y={event.ydata:.0f}")
+        else:
+            self._coords_label.setText("x=---, y=---")
+    
+    def _home_view(self):
+        """Reset view to show all data."""
+        self._ax.autoscale()
+        self._canvas.draw()
+        self._save_view()
+        
+    def _back_view(self):
+        """Go back to previous view."""
+        if self._view_position > 0:
+            self._view_position -= 1
+            self._restore_view(self._view_history[self._view_position])
+            
+    def _forward_view(self):
+        """Go forward to next view."""
+        if self._view_position < len(self._view_history) - 1:
+            self._view_position += 1
+            self._restore_view(self._view_history[self._view_position])
+    
+    def _save_view(self):
+        """Save current view to history."""
+        current_view = (self._ax.get_xlim(), self._ax.get_ylim())
+        if self._view_position == len(self._view_history) - 1:
+            self._view_history.append(current_view)
+            self._view_position += 1
+        else:
+            # Remove forward history when saving new view
+            self._view_history = self._view_history[:self._view_position + 1]
+            self._view_history.append(current_view)
+            self._view_position += 1
+            
+    def _restore_view(self, view):
+        """Restore a saved view."""
+        xlim, ylim = view
+        self._ax.set_xlim(xlim)
+        self._ax.set_ylim(ylim)
+        self._canvas.draw()
+        
     # ---------------- pan/zoom ----------------
     def _on_press(self, event):
+        """Handle mouse press events."""
+        # Always handle pan on shift+click, regardless of polygon mode
         if event.key == "shift" and event.button == 1:
             self._press_event = event
 
     def _on_release(self, event):
+        """Handle mouse release events."""
         self._press_event = None
 
     def _on_motion(self, event):
+        """Handle mouse motion events for panning."""
+        # Pan functionality (shift+drag)
         if self._press_event is None:
             return
         dx = event.xdata - self._press_event.xdata if event.xdata and self._press_event.xdata else 0
@@ -388,20 +649,147 @@ class LassoSelectionDialog(QDialog):
         self._ax.set_xlim(xlim[0]-dx, xlim[1]-dx)
         self._ax.set_ylim(ylim[0]-dy, ylim[1]-dy)
         self._canvas.draw_idle()
+        # Save view for history
+        self._save_view()
 
     def _on_scroll(self, event):
-        base_scale = 1.2
+        """Handle mouse scroll events for zooming with improved sensitivity."""
+        if event.inaxes != self._ax:
+            return
+            
+        # Use even more gradual zoom for smoother experience
+        base_scale = 1.08  # Further reduced for extra smooth zooming
         if event.button == "up":
             scale = 1/base_scale
         elif event.button == "down":
             scale = base_scale
         else:
             scale = 1
-        xlim = self._ax.get_xlim(); ylim = self._ax.get_ylim()
-        cur_xrange = (xlim[1]-xlim[0]) * scale
-        cur_yrange = (ylim[1]-ylim[0]) * scale
-        x_center = event.xdata if event.xdata is not None else (xlim[0]+xlim[1])/2
-        y_center = event.ydata if event.ydata is not None else (ylim[0]+ylim[1])/2
-        self._ax.set_xlim(x_center - cur_xrange/2, x_center + cur_xrange/2)
-        self._ax.set_ylim(y_center - cur_yrange/2, y_center + cur_yrange/2)
-        self._canvas.draw_idle() 
+            
+        # Get current axis limits
+        xlim = self._ax.get_xlim()
+        ylim = self._ax.get_ylim()
+        
+        # Calculate new ranges
+        cur_xrange = (xlim[1] - xlim[0]) * scale
+        cur_yrange = (ylim[1] - ylim[0]) * scale
+        
+        # Use mouse position as zoom center if available, otherwise use plot center
+        if event.xdata is not None and event.ydata is not None:
+            x_center = event.xdata
+            y_center = event.ydata
+        else:
+            x_center = (xlim[0] + xlim[1]) / 2
+            y_center = (ylim[0] + ylim[1]) / 2
+        
+        # Set new limits with smooth transition
+        new_xlim = (x_center - cur_xrange/2, x_center + cur_xrange/2)
+        new_ylim = (y_center - cur_yrange/2, y_center + cur_yrange/2)
+        
+        self._ax.set_xlim(new_xlim)
+        self._ax.set_ylim(new_ylim)
+        self._canvas.draw_idle()
+        # Save view for history
+        self._save_view()
+
+    def _toggle_pan(self, checked):
+        """Toggle pan mode (handled automatically via shift+drag)."""
+        pass
+        
+    def _toggle_zoom(self, checked):
+        """Toggle zoom mode (handled automatically via mouse wheel)."""
+        pass
+        
+    def _configure_plot(self):
+        """Open plot configuration dialog."""
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Configure", 
+                              "Plot configuration:\n\n"
+                              "• Pan: Hold Shift + Left Click and drag\n"
+                              "• Zoom: Use mouse wheel\n"
+                              "• Polygon: Click to add vertices\n"
+                              "• Finish: Double-click or press Enter")
+        
+    def _save_plot(self):
+        """Save the current plot to file."""
+        from PyQt5.QtWidgets import QFileDialog
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Save Plot", "polygon_selection.png", 
+            "PNG files (*.png);;PDF files (*.pdf);;All files (*.*)"
+        )
+        if filename:
+            self._canvas.figure.savefig(filename, dpi=300, bbox_inches='tight')
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Saved", f"Plot saved to:\n{filename}")
+
+    # ---------------- polygon mode management ----------------
+    def _create_polygon_selector(self):
+        """Create or recreate the polygon selector."""
+        if self._poly is not None:
+            self._poly.disconnect_events()
+        
+        if self._polygon_mode:
+            # Create polygon selector only when in polygon mode
+            self._poly = PolygonSelector(
+                self._ax,
+                self._on_select,
+                props=dict(color="yellow", linewidth=3, alpha=0.8),
+                useblit=True
+            )
+        else:
+            self._poly = None
+    
+    def _toggle_polygon_mode(self, checked):
+        """Toggle polygon drawing mode."""
+        self._polygon_mode = checked
+        self._create_polygon_selector()
+        
+        if checked:
+            self._polygon_btn.setText("🔺 Exit Polygon")
+            self._polygon_btn.setToolTip("Click to add vertices • Double-click to finish • ESC to exit")
+            # Update instructions
+            self._update_instructions("🔺 POLYGON MODE: Click to add vertices • Double-click or Enter to finish • Shift+drag to pan")
+        else:
+            self._polygon_btn.setText("🔺 Add Polygon") 
+            self._polygon_btn.setToolTip("Toggle polygon drawing mode • ESC to exit polygon mode")
+            # Clear any active polygon
+            if self._poly is not None:
+                self._poly.disconnect_events()
+                self._poly = None
+            self._canvas.draw()
+            self._update_instructions("🎯 Pan & Zoom mode: Shift+drag to pan • Mouse wheel to zoom • Click polygon button to draw")
+    
+    def _update_instructions(self, text):
+        """Update the instruction text dynamically."""
+        # Find the instruction label and update it
+        for child in self.findChildren(QLabel):
+            if "Instructions:" in child.text() or "POLYGON MODE:" in child.text() or "Pan & Zoom mode:" in child.text():
+                child.setText(text)
+                break
+    
+    # ---------------- key event handling ----------------
+    def _on_key_press(self, event):
+        """Handle key press events."""
+        if event.key == 'shift':
+            self._shift_pressed = True
+        elif event.key == 'escape':
+            # ESC key exits polygon mode
+            if self._polygon_mode:
+                self._polygon_btn.setChecked(False)
+                self._toggle_polygon_mode(False)
+    
+    def _on_key_release(self, event):
+        """Handle key release events."""
+        if event.key == 'shift':
+            self._shift_pressed = False
+    
+    # ---------------- selection ----------------
+    def _on_select(self, verts):
+        path = mpath.Path(verts)
+        mask = path.contains_points(self._coords2d)
+        if not mask.any():
+            QMessageBox.information(self, "Selection", "No cells inside polygon.")
+            return
+        selected_idxs = self._indices[mask]
+        self._viewer._analysis_tools.process_selection(self._viewer._coords_all[selected_idxs])
+        self.accept() 

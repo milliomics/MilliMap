@@ -2,6 +2,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.path as mpath
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvas
 from PyQt5.QtWidgets import (
@@ -9,12 +10,13 @@ from PyQt5.QtWidgets import (
 )
 from scipy.spatial import cKDTree
 import pyvista as pv
+import vtk
 
 # Handle both direct execution and package import
 try:
-    from .dialogs import SectionSelectDialog, LassoSelectionDialog
+    from .dialogs import SectionSelectDialog
 except (ImportError, ValueError):
-    from dialogs import SectionSelectDialog, LassoSelectionDialog
+    from dialogs import SectionSelectDialog
 
 
 class AnalysisTools:
@@ -49,7 +51,7 @@ class AnalysisTools:
             self.viewer._plotter_widget.render()
 
     def start_polygon_selection(self):
-        """Ask user for sections, then open 2-D lasso selection window."""
+        """Enable polygon selection directly on the main 3D view."""
         if self.viewer._adata is None or self.viewer._coords_all is None:
             QMessageBox.warning(self.viewer, "No Data", "Load data and render first.")
             return
@@ -64,29 +66,635 @@ class AnalysisTools:
             return
 
         selected_srcs = dlg.get_selected_sources()
-        self._open_polygon_window(selected_srcs)
+        self._enable_main_screen_polygon_selection(selected_srcs)
 
-    def _open_polygon_window(self, selected_srcs):
-        """Open a separate dialog with 2-D scatter and lasso selector."""
+    def _enable_main_screen_polygon_selection(self, selected_srcs):
+        """Enable polygon selection mode directly on the main 3D viewer."""
         # Determine indices to include
         mask = np.ones(self.viewer._coords_all.shape[0], dtype=bool)
         if selected_srcs and "source" in self.viewer._adata.obs:
             mask = self.viewer._adata.obs["source"].astype(str).isin(selected_srcs).values
 
-        coords2d = self.viewer._coords_all[mask][:, :2]  # drop z
-        indices = np.where(mask)[0]
-
-        # Cluster labels for color coding
-        clusters = None
-        if "clusters" in self.viewer._adata.obs:
-            clusters = self.viewer._adata.obs.iloc[indices]["clusters"].astype(str).to_numpy()
-
-        if coords2d.shape[0] == 0:
+        if not mask.any():
             QMessageBox.information(self.viewer, "No Cells", "No cells in the selected section(s).")
             return
 
-        dialog = LassoSelectionDialog(coords2d, indices, clusters, self.viewer)
-        dialog.exec_()
+        # Store selection info
+        self._polygon_selection_mask = mask
+        self._polygon_selection_sources = selected_srcs
+        self._polygon_points = []
+        self._polygon_actors = []
+        
+        # Store original plotter state to restore later
+        self._original_camera_position = self.viewer._plotter_widget.camera_position
+        
+        # Clear and re-render only selected sections
+        self._render_selected_sections_only()
+        
+        # Add "Selection Mode Enabled" text overlay
+        self._add_selection_mode_overlay()
+        
+        # Lock camera to 2D view (looking down at x-y plane)
+        self._lock_to_2d_view()
+        
+        # Enable polygon point picking
+        self._enable_polygon_picking()
+        
+        # Add instructions
+        QMessageBox.information(
+            self.viewer, 
+            "Polygon Selection Active", 
+            "🔺 Polygon Selection Mode Enabled!\n\n"
+            "• Click to add polygon vertices\n"
+            "• Shift+click and drag to pan around\n"
+            "• Right-click or press ENTER to finish polygon\n"
+            "• ESC to exit selection mode\n"
+            "• View is locked to X-Y coordinates\n"
+            "• Only selected sections are visible"
+        )
+
+    def _render_selected_sections_only(self):
+        """Re-render the view to show only selected sections with exact same colors as main screen."""
+        # Clear the current view
+        self.viewer._plotter_widget.clear()
+        
+        # Get coordinates for selected sections only
+        coords_selected = self.viewer._coords_all[self._polygon_selection_mask]
+        
+        if coords_selected.shape[0] == 0:
+            return
+        
+        # Use the EXACT same color logic as the main screen's _render_spatial method
+        if "clusters" in self.viewer._adata.obs and coords_selected.shape[0] > 0:
+            clusters_series = self.viewer._adata.obs["clusters"].astype(str)
+            clusters_selected = clusters_series[self._polygon_selection_mask]
+
+            colours = None  # will populate below
+
+            # Generate colors using EXACT same logic as main screen _render_spatial
+            all_cats = np.sort(np.unique(clusters_series))
+            
+            if self.viewer._color_scheme == "anndata" and "clusters_colors" in self.viewer._adata.obs:
+                try:
+                    # Get colors for selected cells directly from obs
+                    colors_selected = self.viewer._adata.obs["clusters_colors"][self._polygon_selection_mask]
+                    # Convert color strings to RGB values
+                    import matplotlib.colors as mcolors
+                    colours = np.vstack([mcolors.to_rgb(str(c)) for c in colors_selected]) * 255
+                except Exception:
+                    colours = None  # fallback if color parsing fails
+            
+            # Apply selected color scheme or fallback (same as main screen)
+            if colours is None:
+                try:
+                    if self.viewer._color_scheme == "plotly_d3":
+                        from .colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "custom_turbo":
+                        from .colors import generate_custom_turbo_palette
+                        palette = generate_custom_turbo_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "sns_palette":
+                        from .colors import generate_sns_palette
+                        palette = generate_sns_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "milliomics":
+                        from .colors import generate_milliomics_palette
+                        palette = generate_milliomics_palette(len(all_cats))
+                    else:  # fallback to plotly_d3
+                        from .colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(all_cats))
+                except (ImportError, ValueError):
+                    # Fall back to absolute imports
+                    if self.viewer._color_scheme == "plotly_d3":
+                        from colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "custom_turbo":
+                        from colors import generate_custom_turbo_palette
+                        palette = generate_custom_turbo_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "sns_palette":
+                        from colors import generate_sns_palette
+                        palette = generate_sns_palette(len(all_cats))
+                    elif self.viewer._color_scheme == "milliomics":
+                        from colors import generate_milliomics_palette
+                        palette = generate_milliomics_palette(len(all_cats))
+                    else:  # fallback to plotly_d3
+                        from colors import generate_plotly_extended_palette
+                        palette = generate_plotly_extended_palette(len(all_cats))
+                
+                lookup = {cat: palette[i % len(palette)] for i, cat in enumerate(all_cats)}
+                colours = np.vstack([lookup[c] for c in clusters_selected]) * 255
+        else:
+            colours = np.full((len(coords_selected), 3), 255, dtype=np.uint8)
+        
+        # Add selected sections with colors using same parameters as main screen
+        cloud_selected = pv.PolyData(coords_selected)
+        cloud_selected["colors"] = colours
+        self.viewer._plotter_widget.add_mesh(
+            cloud_selected,
+            scalars="colors",
+            rgb=True,
+            point_size=5,  # Same as main screen
+            render_points_as_spheres=True,
+            opacity=self.viewer._point_opacity,  # Same opacity as main screen
+        )
+        
+        # Add invisible cloud for picking (only selected sections)
+        self.viewer._plotter_widget.add_mesh(
+            pv.PolyData(coords_selected),
+            color=(1, 1, 1),
+            opacity=0.0,
+            point_size=10,
+            pickable=True,
+            name="_polygon_pick_cloud",
+            render_points_as_spheres=False,
+        )
+        
+        # Set background
+        self.viewer._plotter_widget.set_background("black")
+        self.viewer._plotter_widget.render()
+
+    def _add_selection_mode_overlay(self):
+        """Add 'Selection Mode Enabled' text overlay to top-left corner."""
+        try:
+            # Remove any existing selection overlay
+            if hasattr(self, '_selection_text_actor'):
+                self.viewer._plotter_widget.remove_actor(self._selection_text_actor)
+            
+            # Add new text overlay with Arial font
+            self._selection_text_actor = self.viewer._plotter_widget.add_text(
+                "🔺 Selection Mode Enabled\nClick to add polygon points • Shift+click to pan • Right-click to finish • ESC to exit",
+                position="upper_left",
+                font_size=13,
+                color="yellow",
+                font="arial",
+                name="selection_overlay"
+            )
+        except Exception as e:
+            print(f"Could not add text overlay: {e}")
+
+    def _lock_to_2d_view(self):
+        """Lock camera to look down at x-y plane (disable z rotation)."""
+        try:
+            # Calculate bounds for the 2D view using only selected sections
+            coords = self.viewer._coords_all[self._polygon_selection_mask]
+            x_center = (coords[:, 0].max() + coords[:, 0].min()) / 2
+            y_center = (coords[:, 1].max() + coords[:, 1].min()) / 2
+            z_center = (coords[:, 2].max() + coords[:, 2].min()) / 2
+            
+            # Set camera to look down at x-y plane
+            view_distance = max(coords[:, 0].ptp(), coords[:, 1].ptp()) * 1.2
+            camera_pos = [x_center, y_center, z_center + view_distance]
+            focal_point = [x_center, y_center, z_center]
+            view_up = [0, 1, 0]  # Y-axis up
+            
+            # Set camera position
+            self.viewer._plotter_widget.camera_position = [camera_pos, focal_point, view_up]
+            self.viewer._plotter_widget.camera.parallel_projection = True
+            
+            # COMPLETELY disable camera interaction to lock to 2D
+            self.viewer._plotter_widget.disable_fly_to_plane()
+            
+            # Disable all camera movements
+            interactor = self.viewer._plotter_widget.interactor
+            
+            # Remove all existing camera interaction styles
+            interactor.SetInteractorStyle(None)
+            
+            # Create a custom interactor style that only allows picking
+            style = vtk.vtkInteractorStyleUser()
+            interactor.SetInteractorStyle(style)
+            
+            # Store for restoration
+            self._original_interactor_style = interactor.GetInteractorStyle()
+            
+            self.viewer._plotter_widget.render()
+            
+        except Exception as e:
+            print(f"Could not lock to 2D view: {e}")
+
+    def _enable_polygon_picking(self):
+        """Enable point picking for polygon creation."""
+        try:
+            # Disable any existing picking
+            self.viewer._plotter_widget.disable_picking()
+            
+            # Initialize panning state
+            self._is_panning = False
+            self._pan_start_pos = None
+            self._pan_last_pos = None
+            
+            # Add mouse event observers
+            self.viewer._plotter_widget.interactor.AddObserver("LeftButtonPressEvent", self._on_polygon_mouse_press)
+            self.viewer._plotter_widget.interactor.AddObserver("LeftButtonReleaseEvent", self._on_polygon_mouse_release)
+            self.viewer._plotter_widget.interactor.AddObserver("MouseMoveEvent", self._on_polygon_mouse_move)
+            self.viewer._plotter_widget.interactor.AddObserver("RightButtonPressEvent", self._finish_polygon_selection)
+            self.viewer._plotter_widget.interactor.AddObserver("KeyPressEvent", self._on_key_press_polygon)
+            
+        except Exception as e:
+            print(f"Could not enable polygon picking: {e}")
+
+    def _on_polygon_mouse_press(self, obj, event):
+        """Handle left mouse press - check for shift+click for panning."""
+        try:
+            # Check if shift is pressed
+            interactor = self.viewer._plotter_widget.interactor
+            shift_pressed = interactor.GetShiftKey()
+            
+            if shift_pressed:
+                # Start panning mode
+                self._is_panning = True
+                x, y = interactor.GetEventPosition()
+                self._pan_start_pos = np.array([x, y])
+                self._pan_last_pos = np.array([x, y])
+                # Store initial camera position
+                self._pan_start_camera = self.viewer._plotter_widget.camera_position
+            else:
+                # Regular polygon point selection
+                self._add_polygon_point_from_click()
+                
+        except Exception as e:
+            print(f"Error in polygon mouse press: {e}")
+
+    def _on_polygon_mouse_release(self, obj, event):
+        """Handle left mouse release - end panning if active."""
+        self._is_panning = False
+        self._pan_start_pos = None
+        self._pan_last_pos = None
+
+    def _on_polygon_mouse_move(self, obj, event):
+        """Handle mouse movement for panning."""
+        # Only pan if we're actively panning AND shift is still being held
+        if not self._is_panning or self._pan_start_pos is None:
+            return
+            
+        # Check if shift is still being held - if not, stop panning
+        interactor = self.viewer._plotter_widget.interactor
+        if not interactor.GetShiftKey():
+            self._is_panning = False
+            self._pan_start_pos = None
+            self._pan_last_pos = None
+            return
+            
+        try:
+            # Get current mouse position
+            x, y = self.viewer._plotter_widget.interactor.GetEventPosition()
+            current_pos = np.array([x, y])
+            
+            # Calculate movement delta
+            delta = current_pos - self._pan_last_pos
+            self._pan_last_pos = current_pos
+            
+            # Apply panning - convert screen space movement to world space
+            camera = self.viewer._plotter_widget.camera
+            
+            # Get current camera parameters
+            position = np.array(camera.position)
+            focal_point = np.array(camera.focal_point)
+            
+            # Calculate pan factors based on view distance and screen size
+            view_distance = np.linalg.norm(position - focal_point)
+            renderer = self.viewer._plotter_widget.renderer
+            size = renderer.GetSize()
+            pan_factor = view_distance / max(size)
+            
+            # Apply movement (invert Y for natural panning feel)
+            dx = -delta[0] * pan_factor
+            dy = delta[1] * pan_factor
+            
+            # Update camera position and focal point
+            new_position = position + np.array([dx, dy, 0])
+            new_focal_point = focal_point + np.array([dx, dy, 0])
+            
+            # Set new camera position
+            camera.position = new_position
+            camera.focal_point = new_focal_point
+            
+            self.viewer._plotter_widget.render()
+            
+        except Exception as e:
+            print(f"Error in panning: {e}")
+
+    def _add_polygon_point_from_click(self):
+        """Add polygon point from current click position."""
+        try:
+            # Get click position
+            x, y = self.viewer._plotter_widget.interactor.GetEventPosition()
+            
+            # Pick the 3D point at this screen position
+            picker = vtk.vtkWorldPointPicker()
+            picker.Pick(x, y, 0, self.viewer._plotter_widget.renderer)
+            world_pos = picker.GetPickPosition()
+            
+            # Convert to numpy array
+            point = np.array(world_pos)
+            
+            # Find closest actual data point to snap to
+            coords_selected = self.viewer._coords_all[self._polygon_selection_mask]
+            if len(coords_selected) == 0:
+                return
+                
+            # Find closest point in selected data
+            distances = np.linalg.norm(coords_selected - point, axis=1)
+            closest_idx = np.argmin(distances)
+            snapped_point = coords_selected[closest_idx]
+            
+            # Add this point to polygon
+            self._add_polygon_point(snapped_point)
+            
+        except Exception as e:
+            print(f"Error in adding polygon point: {e}")
+
+    def _add_polygon_point(self, point):
+        """Add a polygon vertex and update visualization."""
+        self._polygon_points.append(point)
+        
+        # Calculate smaller adaptive radius based on selected data scale
+        coords = self.viewer._coords_all[self._polygon_selection_mask]
+        scene_scale = max(coords[:, 0].ptp(), coords[:, 1].ptp(), coords[:, 2].ptp())
+        sphere_radius = scene_scale * 0.003  # Reduced from 0.01 to 0.003 for smaller points
+        
+        # Add visual marker for the point
+        sphere = pv.Sphere(radius=sphere_radius, center=point)
+        actor = self.viewer._plotter_widget.add_mesh(
+            sphere,
+            color="yellow",
+            opacity=0.9,
+            name=f"polygon_point_{len(self._polygon_points)}"
+        )
+        self._polygon_actors.append(actor)
+        
+        # If we have more than one point, draw line between last two points
+        if len(self._polygon_points) > 1:
+            # Create line between last two points
+            points = np.array([self._polygon_points[-2], self._polygon_points[-1]])
+            line = pv.Line(points[0], points[1])
+            line_actor = self.viewer._plotter_widget.add_mesh(
+                line,
+                color="yellow",
+                line_width=5,
+                opacity=0.9,
+                name=f"polygon_line_{len(self._polygon_points)}"
+            )
+            self._polygon_actors.append(line_actor)
+        
+        self.viewer._plotter_widget.render()
+        
+        # Update status
+        self._update_selection_overlay(f"🔺 Selection Mode: {len(self._polygon_points)} points added")
+
+    def _on_key_press_polygon(self, obj, event):
+        """Handle key press events during polygon selection."""
+        key = self.viewer._plotter_widget.interactor.GetKeySym()
+        
+        if key.lower() == 'escape':
+            self._exit_polygon_selection()
+        elif key.lower() in ['return', 'enter']:
+            self._finish_polygon_selection()
+
+    def _finish_polygon_selection(self, obj=None, event=None):
+        """Finish polygon selection and process the selection."""
+        if len(self._polygon_points) < 3:
+            QMessageBox.warning(
+                self.viewer, 
+                "Insufficient Points", 
+                "Need at least 3 points to create a polygon."
+            )
+            return
+        
+        # Close the polygon by connecting last point to first
+        if len(self._polygon_points) > 2:
+            points = np.array([self._polygon_points[-1], self._polygon_points[0]])
+            line = pv.Line(points[0], points[1])
+            line_actor = self.viewer._plotter_widget.add_mesh(
+                line,
+                color="yellow",
+                line_width=5,
+                name="polygon_closing_line"
+            )
+            self._polygon_actors.append(line_actor)
+            self.viewer._plotter_widget.render()
+        
+        # Process the polygon selection (this will show the 3-button confirmation)
+        self._process_polygon_selection()
+
+    def _process_polygon_selection(self):
+        """Process the polygon selection to find cells inside."""
+        # Convert 3D points to 2D for polygon checking
+        polygon_2d = np.array([[p[0], p[1]] for p in self._polygon_points])
+        path = mpath.Path(polygon_2d)
+        
+        # Get 2D coordinates of all cells in selected sections
+        coords_2d = self.viewer._coords_all[self._polygon_selection_mask][:, :2]
+        indices = np.where(self._polygon_selection_mask)[0]
+        
+        # Check which points are inside the polygon
+        inside_mask = path.contains_points(coords_2d)
+        
+        if not inside_mask.any():
+            QMessageBox.information(self.viewer, "Selection", "No cells inside polygon.")
+            return
+        
+        # Get the selected indices
+        selected_indices = indices[inside_mask]
+        selected_coords = self.viewer._coords_all[selected_indices]
+        
+        # Highlight the selected cells before processing
+        self._highlight_selected_cells(selected_coords)
+        
+        # Create custom confirmation dialog with three buttons
+        msg_box = QMessageBox(self.viewer)
+        msg_box.setWindowTitle("Confirm Selection")
+        msg_box.setText(f"Found {len(selected_indices)} cells inside polygon.")
+        msg_box.setInformativeText("What would you like to do?")
+        msg_box.setIcon(QMessageBox.Question)
+        
+        # Add custom buttons in order from left to right
+        quit_btn = msg_box.addButton("Quit Selection", QMessageBox.RejectRole)
+        reselect_btn = msg_box.addButton("Reselect", QMessageBox.ResetRole) 
+        continue_btn = msg_box.addButton("Continue", QMessageBox.AcceptRole)
+        
+        # Set the default button (Continue) and make it prominent
+        msg_box.setDefaultButton(continue_btn)
+        
+        # Style the dialog for better appearance
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                font-size: 12px;
+            }
+            QPushButton {
+                min-width: 80px;
+                padding: 6px 12px;
+                font-size: 11px;
+            }
+            QPushButton[text="Continue"] {
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+            }
+        """)
+        
+        # Execute the dialog
+        msg_box.exec_()
+        clicked_button = msg_box.clickedButton()
+        
+        if clicked_button == continue_btn:
+            # Process the selection and exit
+            self._remove_selection_highlight()
+            self.process_selection(selected_coords)
+            self._exit_polygon_selection()
+        elif clicked_button == reselect_btn:
+            # Clear current polygon and start over
+            self._remove_selection_highlight()
+            self._clear_current_polygon()
+            self._update_selection_overlay("🔺 Selection Mode: Reselecting - click to add new polygon points")
+        else:  # quit_btn
+            # Exit selection mode completely
+            self._remove_selection_highlight()
+            self._exit_polygon_selection()
+
+    def _clear_current_polygon(self):
+        """Clear the current polygon points and visual elements."""
+        # Remove all current polygon visual elements
+        for actor in self._polygon_actors:
+            try:
+                self.viewer._plotter_widget.remove_actor(actor)
+            except:
+                pass
+        
+        # Clear polygon data
+        self._polygon_points = []
+        self._polygon_actors = []
+        
+        self.viewer._plotter_widget.render()
+
+    def _highlight_selected_cells(self, selected_coords):
+        """Temporarily highlight selected cells for confirmation."""
+        try:
+            # Calculate radius for highlighting
+            coords = self.viewer._coords_all[self._polygon_selection_mask]
+            scene_scale = max(coords[:, 0].ptp(), coords[:, 1].ptp(), coords[:, 2].ptp())
+            highlight_radius = scene_scale * 0.005
+            
+            # Create highlight mesh
+            points = pv.PolyData(selected_coords)
+            self._selection_highlight_actor = self.viewer._plotter_widget.add_mesh(
+                points,
+                color="red",
+                point_size=8,
+                opacity=0.8,
+                render_points_as_spheres=True,
+                name="selection_highlight"
+            )
+            self.viewer._plotter_widget.render()
+        except Exception as e:
+            print(f"Could not highlight selection: {e}")
+
+    def _remove_selection_highlight(self):
+        """Remove selection highlight."""
+        try:
+            if hasattr(self, '_selection_highlight_actor') and self._selection_highlight_actor is not None:
+                self.viewer._plotter_widget.remove_actor(self._selection_highlight_actor)
+                self._selection_highlight_actor = None
+                self.viewer._plotter_widget.render()
+        except Exception as e:
+            print(f"Could not remove highlight: {e}")
+
+    def _exit_polygon_selection(self):
+        """Exit polygon selection mode and restore normal view."""
+        # Remove all polygon visual elements
+        for actor in self._polygon_actors:
+            try:
+                self.viewer._plotter_widget.remove_actor(actor)
+            except:
+                pass
+        
+        # Remove selection overlay text
+        if hasattr(self, '_selection_text_actor'):
+            try:
+                self.viewer._plotter_widget.remove_actor(self._selection_text_actor)
+            except:
+                pass
+        
+        # Remove any selection highlights
+        self._remove_selection_highlight()
+        
+        # Restore original camera position and settings
+        if hasattr(self, '_original_camera_position'):
+            try:
+                self.viewer._plotter_widget.camera_position = self._original_camera_position
+                self.viewer._plotter_widget.camera.parallel_projection = False
+            except:
+                pass
+        
+        # Restore original interactor style
+        try:
+            # Reset to default PyVista interactor style
+            import vtk
+            default_style = vtk.vtkInteractorStyleTrackballCamera()
+            self.viewer._plotter_widget.interactor.SetInteractorStyle(default_style)
+        except:
+            pass
+        
+        # Re-enable normal camera interaction
+        try:
+            self.viewer._plotter_widget.enable_fly_to_plane()
+        except:
+            pass
+        
+        # Disable picking
+        try:
+            self.viewer._plotter_widget.disable_picking()
+        except:
+            pass
+        
+        # Remove observers
+        try:
+            self.viewer._plotter_widget.interactor.RemoveObservers("LeftButtonPressEvent")
+            self.viewer._plotter_widget.interactor.RemoveObservers("LeftButtonReleaseEvent")
+            self.viewer._plotter_widget.interactor.RemoveObservers("MouseMoveEvent")
+            self.viewer._plotter_widget.interactor.RemoveObservers("RightButtonPressEvent")
+            self.viewer._plotter_widget.interactor.RemoveObservers("KeyPressEvent")
+        except:
+            pass
+        
+        # Restore original data view (re-render all data as it was)
+        try:
+            if self.viewer._mode == "cell":
+                self.viewer._render_spatial()
+            elif self.viewer._mode == "gene":
+                self.viewer._render_gene_mode()
+            elif self.viewer._mode == "gene_spots":
+                self.viewer._render_gene_only()
+        except:
+            pass
+        
+        # Clear stored data
+        self._polygon_points = []
+        self._polygon_actors = []
+        if hasattr(self, '_polygon_selection_mask'):
+            del self._polygon_selection_mask
+        if hasattr(self, '_polygon_selection_sources'):
+            del self._polygon_selection_sources
+        
+        self.viewer._plotter_widget.render()
+        
+        QMessageBox.information(self.viewer, "Selection Complete", "Polygon selection mode exited. View restored.")
+
+    def _update_selection_overlay(self, text):
+        """Update the selection mode overlay text."""
+        try:
+            if hasattr(self, '_selection_text_actor'):
+                self.viewer._plotter_widget.remove_actor(self._selection_text_actor)
+            
+            self._selection_text_actor = self.viewer._plotter_widget.add_text(
+                text + "\nShift+click to pan • Right-click to finish • ESC to exit",
+                position="upper_left",
+                font_size=13,
+                color="yellow",
+                font="arial",
+                name="selection_overlay"
+            )
+        except Exception as e:
+            print(f"Could not update overlay: {e}")
 
     def start_circle_selection(self):
         """Start interactive circle selection for spatial analysis."""
