@@ -6,16 +6,16 @@ from PyQt5.QtGui import QIcon
 # Handle both direct execution and package import
 try:
     # Try relative import first (when used as package)
-    from .viewer import SpatialOmicsViewer
+    from .viewer import MillimapViewer
 except (ImportError, ValueError):
     # Fall back to absolute import (when run directly or imported directly)
     try:
-        from viewer import SpatialOmicsViewer
+        from viewer import MillimapViewer
     except ImportError:
         # If that fails, try adding current directory to path
         import os
         sys.path.insert(0, os.path.dirname(__file__))
-        from viewer import SpatialOmicsViewer
+        from viewer import MillimapViewer
 
 
 def main() -> None:
@@ -24,7 +24,7 @@ def main() -> None:
     icon_path = "/Users/farah/Library/CloudStorage/GoogleDrive-qianluf2@illinois.edu/My Drive/Milliomics/Designs/cakeinvert.png"
     if pathlib.Path(icon_path).exists():
         app.setWindowIcon(QIcon(icon_path))
-    viewer = SpatialOmicsViewer()
+    viewer = MillimapViewer()
     viewer.show()
     sys.exit(app.exec_())
 

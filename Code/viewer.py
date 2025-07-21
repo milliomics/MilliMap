@@ -50,6 +50,7 @@ try:
         SectionSelectDialog,
         LassoSelectionDialog
     )
+    from .analysis import create_analysis_tools
 except (ImportError, ValueError):
     from colors import (
         generate_plotly_extended_palette,
@@ -63,10 +64,11 @@ except (ImportError, ValueError):
         SectionSelectDialog,
         LassoSelectionDialog
     )
+    from analysis import create_analysis_tools
 
 
-class SpatialOmicsViewer(QMainWindow):
-    """A lightweight viewer for spatial omics AnnData objects (.h5ad).
+class MillimapViewer(QMainWindow):
+    """Millimap: A lightweight viewer for spatial omics AnnData objects (.h5ad).
 
     Users can drag-and-drop an AnnData file onto the window or use the
     "Load File" button to pick a file. The viewer looks for the
@@ -76,7 +78,7 @@ class SpatialOmicsViewer(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Spatial Omics Viewer")
+        self.setWindowTitle("Millimap - Spatial Omics Viewer")
         self.resize(1400, 800)
         self.setAcceptDrops(True)
 
@@ -94,6 +96,10 @@ class SpatialOmicsViewer(QMainWindow):
             painter.drawPixmap(0, 0, pix)
             painter.end()
             self.setWindowIcon(QIcon(white_bg))
+
+        # Initialize analysis mode flag and tools early
+        self._analysis_mode = False
+        self._analysis_tools = create_analysis_tools(self)
 
         # Central widget --------------------------------------------------------
         self._central_widget = QWidget(self)
@@ -247,11 +253,11 @@ class SpatialOmicsViewer(QMainWindow):
         self._analysis_layout = QVBoxLayout(self._analysis_group)
 
         ana_poly_btn = QPushButton("+ Polygon")
-        ana_poly_btn.clicked.connect(self._start_polygon_selection)
+        ana_poly_btn.clicked.connect(self._analysis_tools.start_polygon_selection)
         ana_circle_btn = QPushButton("+ Circle")
-        ana_circle_btn.clicked.connect(self._start_circle_selection)
+        ana_circle_btn.clicked.connect(self._analysis_tools.start_circle_selection)
         ana_point_btn = QPushButton("+ Point")
-        ana_point_btn.clicked.connect(self._start_point_selection)
+        ana_point_btn.clicked.connect(self._analysis_tools.start_point_selection)
 
         self._analysis_layout.addWidget(ana_poly_btn)
         self._analysis_layout.addWidget(ana_circle_btn)
@@ -275,7 +281,7 @@ class SpatialOmicsViewer(QMainWindow):
         # Analysis mode toggle button
         self._analysis_btn = QPushButton("Analysis Mode", self)
         self._analysis_btn.setCheckable(True)
-        self._analysis_btn.toggled.connect(self._toggle_analysis_mode)
+        self._analysis_btn.toggled.connect(self._analysis_tools.toggle_analysis_mode)
         bottom_layout.addWidget(self._analysis_btn)
 
         self._load_btn = QPushButton("Load File", self)
@@ -291,8 +297,7 @@ class SpatialOmicsViewer(QMainWindow):
         self._mode = "cell"  # "gene" (cell-based spot csv) or "gene_spots"
         self._gene_only = False  # toggle state
 
-        # New: Analysis mode flag
-        self._analysis_mode = False
+
 
         # Default opacity for rendered selected points (0.5 = 50% transparency)
         self._point_opacity = 0.6
@@ -887,171 +892,4 @@ class SpatialOmicsViewer(QMainWindow):
                 self._mode = "cell"
                 self._render_spatial()
 
-    # ---------------------------------------------------------------------
-    # Analysis mode helpers
-    # ---------------------------------------------------------------------
-    def _toggle_analysis_mode(self, checked: bool):
-        """Enable/disable analysis mode and show/hide tools."""
-        self._analysis_mode = checked
-        self._analysis_group.setVisible(checked)
-        if not checked:
-            # Disable any active picking
-            try:
-                self._plotter_widget.disable_picking()
-            except Exception:
-                pass
-            # Remove selection actor
-            if self._analysis_selection_actor is not None:
-                try:
-                    self._plotter_widget.remove_actor(self._analysis_selection_actor)
-                except Exception:
-                    pass
-                self._analysis_selection_actor = None
-            self._plotter_widget.render()
-
-    def _start_polygon_selection(self):
-        """Ask user for sections, then open 2-D lasso selection window."""
-        if self._adata is None or self._coords_all is None:
-            QMessageBox.warning(self, "No Data", "Load data and render first.")
-            return
-
-        # Collect section names
-        sources = []
-        if "source" in self._adata.obs:
-            sources = sorted(self._adata.obs["source"].astype(str).unique())
-
-        dlg = SectionSelectDialog(sources, self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        selected_srcs = dlg.get_selected_sources()
-        self._open_polygon_window(selected_srcs)
-
-    def _open_polygon_window(self, selected_srcs: list[str]):
-        """Open a separate dialog with 2-D scatter and lasso selector."""
-        # Determine indices to include
-        mask = np.ones(self._coords_all.shape[0], dtype=bool)
-        if selected_srcs and "source" in self._adata.obs:
-            mask = self._adata.obs["source"].astype(str).isin(selected_srcs).values
-
-        coords2d = self._coords_all[mask][:, :2]  # drop z
-        indices = np.where(mask)[0]
-
-        # Cluster labels for color coding
-        clusters = None
-        if "clusters" in self._adata.obs:
-            clusters = self._adata.obs.iloc[indices]["clusters"].astype(str).to_numpy()
-
-        if coords2d.shape[0] == 0:
-            QMessageBox.information(self, "No Cells", "No cells in the selected section(s).")
-            return
-
-        dialog = LassoSelectionDialog(coords2d, indices, clusters, self)
-        dialog.exec_()
-
-    def _start_circle_selection(self):
-        if self._adata is None or self._coords_all is None:
-            QMessageBox.warning(self, "No Data", "Load data and render first.")
-            return
-
-        # Disable any previous picking to avoid PyVista error
-        try:
-            self._plotter_widget.disable_picking()
-        except Exception:
-            pass
-
-        def _picked(picked_point):
-            if picked_point is None or len(picked_point) == 0:
-                return
-            center = np.array(picked_point)
-            # Ask for radius
-            rad, ok = QInputDialog.getDouble(self, "Circle Radius", "Enter radius (same units as coords):", 50.0, 0.1, 1e6, 1)
-            if not ok:
-                return
-            # Query KD-tree or direct distance
-            if self._kd_tree is not None:
-                idxs = self._kd_tree.query_ball_point(center, r=rad)
-            else:
-                dists = np.linalg.norm(self._coords_all - center, axis=1)
-                idxs = np.where(dists <= rad)[0].tolist()
-            if not idxs:
-                QMessageBox.information(self, "Selection", "No cells within radius.")
-                return
-            self._process_selection(self._coords_all[idxs])
-
-        # Enable single point picking
-        self._plotter_widget.enable_point_picking(callback=lambda mesh: _picked(mesh.points[0]), show_message=True)
-
-    def _start_point_selection(self):
-        if self._adata is None or self._coords_all is None:
-            QMessageBox.warning(self, "No Data", "Load data and render first.")
-            return
-
-        try:
-            self._plotter_widget.disable_picking()
-        except Exception:
-            pass
-
-        def _picked(mesh):
-            if mesh is None or mesh.n_points == 0:
-                return
-            pt = mesh.points[0]
-            self._process_selection(np.array([pt]))
-
-        self._plotter_widget.enable_point_picking(callback=_picked, show_message=True)
-
-    def _process_selection(self, selected_pts: np.ndarray):
-        """Given a set of selected XYZ coordinates, compute stats and plot."""
-        if self._coords_all is None:
-            return
-
-        # Match selected coordinates back to indices – use tolerance for float comparisons
-        sel_indices = []
-        for pt in selected_pts:
-            # Compare with tolerance 1e-5
-            dists = np.linalg.norm(self._coords_all - pt, axis=1)
-            idx = np.where(dists < 1e-5)[0]
-            if idx.size:
-                sel_indices.extend(idx.tolist())
-        if not sel_indices:
-            QMessageBox.information(self, "Selection", "No cells matched the selected region.")
-            return
-
-        sel_indices = np.unique(sel_indices)
-
-        if "clusters" not in self._adata.obs:
-            QMessageBox.information(self, "Missing Clusters", "AnnData lacks 'clusters' information for analysis.")
-            return
-        clusters = self._adata.obs.iloc[sel_indices]["clusters"].astype(str)
-        counts = clusters.value_counts()
-        perc = counts / counts.sum() * 100
-
-        # Plot percentages in embedded dialog ---------------------------------
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Cell type composition")
-        dlg.resize(500, 400)
-        vbox = QVBoxLayout(dlg)
-        canvas = FigureCanvas(plt.Figure(figsize=(5, 3)))
-        vbox.addWidget(canvas)
-        ax = canvas.figure.subplots()
-        ax.bar(perc.index, perc.values, color="#1f77b4")
-        ax.set_ylabel("Percentage (%)")
-        ax.set_title("Cell type composition in selection")
-        ax.set_xticklabels(perc.index, rotation=45, ha="right")
-        canvas.figure.tight_layout()
-        dlg.exec_()
-
-        # Highlight selected region in viewer (optional)
-        if self._analysis_selection_actor is not None:
-            try:
-                self._plotter_widget.remove_actor(self._analysis_selection_actor)
-            except Exception:
-                pass
-        self._analysis_selection_actor = self._plotter_widget.add_mesh(
-            pv.PolyData(selected_pts),
-            color="yellow",
-            opacity=0.3,
-            point_size=8,
-            render_points_as_spheres=True,
-        )
-        self._plotter_widget.render() 
+ 
