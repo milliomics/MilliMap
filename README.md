@@ -1,26 +1,26 @@
-# 🧬 MilliMap: Spatial Omics Viewer
+# MilliMap: Spatial Omics Viewer
 
 A lightweight, interactive 3D viewer for spatial omics AnnData (.h5ad) with filtering, analysis, and semi-automatic cell-type annotation.
 
-## 🔬 Overview
+## Overview
 
 MilliMap is a PyQt5 + PyVista application for exploring large spatial transcriptomics datasets in 3D with real-time filtering and analysis. It includes tools for differential expression, violin plots, and a semi-automatic annotation workflow from marker genes.
 
-## ✨ Key Features
+## Key Features
 
-### 🎯 Visualization and Filtering
+### Visualization and Filtering
 - 3D interactive scatter via PyVista (top-down camera by default)
 - Color schemes: Plotly/D3, Seaborn, Custom Turbo, Milliomics, or colors from AnnData
 - Multi-select filters: clusters, sections (sources), and gene expression thresholds
 - Hover dialog with per-cell info; optional selection tools (polygon, circle, point)
 
-### 📈 Expression Analytics
+### Expression Analytics
 - Violin plots (standard and advanced) with per-gene and per-group options
 - DE analysis:
   - Top DEG expression heatmap (Scanpy if available; robust fallbacks)
   - DE Volcano plot with q-value and |log2FC| thresholds
 
-### 🧭 Annotation Tools
+### Annotation Tools
 - Cluster Annotation Helper: add/edit/remove cluster → annotation mappings; CSV load/save
 - Semi-automatic Marker Annotation dialog:
   - Load markers from CSV/XLSX: columns `gene_id` (or `gene`), `annotation`, optional `weight`
@@ -30,7 +30,7 @@ MilliMap is a PyQt5 + PyVista application for exploring large spatial transcript
   - Controls for thresholds, top-K, weights; Mean/Variance only toggle
   - Apply best labels to the in-session annotations and export tables
 
-## 🚀 Installation
+## Installation
 
 ### Prerequisites
 ```bash
@@ -47,7 +47,7 @@ pip install -r millimap/requirements.txt
 pip install openpyxl
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 Milliomics/
@@ -66,7 +66,7 @@ Milliomics/
 └── data/ …
 ```
 
-## 🎮 Usage
+## Usage
 
 ### Launch the viewer
 ```bash
@@ -84,7 +84,7 @@ python -m millimap.Code.main
 - Recommended (optional): `obs['clusters']`, `obs['source']`
 - Expression matrix in `.X` (or additional `layers`) used by analytics.
 
-## 🧪 Semi-automatic annotation
+## Semi-automatic annotation
 
 ### Marker format
 ```csv
@@ -101,7 +101,7 @@ PVALB,PV interneuron,1.2
 - Per-annotation mode: aggregates scores from multiple markers per annotation (co-expression aware). Controls for top-K, min gene score, coverage/consistency weights. Mean/Variance only sets α=1, β=γ=0.
 - Apply labels: merges into in-session annotations; Load/Save via helper.
 
-## 🔍 Parameter search (offline)
+## Parameter search (offline)
 
 Use the standalone script to search parameters against ground-truth labels:
 ```bash
@@ -116,7 +116,7 @@ python millimap/Code/param_search_annotation.py \
 ```
 Outputs: `<prefix>_results.csv`, `<prefix>_best_config.json`, `<prefix>_best_predictions.csv`.
 
-## 🎨 Color schemes
+## Color schemes
 
 Palettes: Plotly/D3, Custom Turbo, Seaborn, Milliomics, or colors carried in AnnData. Switch via the “Colors” button.
 
@@ -124,13 +124,13 @@ Palettes: Plotly/D3, Custom Turbo, Seaborn, Milliomics, or colors carried in Ann
 - For clustering upstream, prefer highly variable genes (HVGs) or a focused panel rather than all genes for large datasets.
 - When using small targeted panels, clustering with all genes is acceptable.
 
-## 📄 License
+## License
 
 MIT License. See `LICENSE`.
 
-## 💬 Support
+## Support
 - Open issues or questions in your repository tracker, or contact the maintainers.
 
 —
 
-MilliMap — fast, flexible visualization and annotation for spatial omics 🧬
+MilliMap — fast, flexible visualization and annotation for spatial omics
